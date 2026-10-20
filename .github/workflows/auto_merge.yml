@@ -1,0 +1,98 @@
+name: Auto Merge and Sort
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  auto-merge:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure Git User
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Merge PR and Sort index.html
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_USER: ${{ github.event.pull_request.user.login }}
+          PR_REF: ${{ github.event.pull_request.head.ref }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [ -z "$PR_NUMBER" ]; then
+            echo "No PR number provided (workflow_dispatch run)."
+            exit 0
+          fi
+
+          git fetch origin pull/${PR_NUMBER}/head:pr-${PR_NUMBER}
+
+          python3 -c '
+          import subprocess, re, os
+
+          pr_number = os.environ["PR_NUMBER"]
+          pr_user = os.environ["PR_USER"]
+          pr_ref = os.environ["PR_REF"]
+
+          def parse_entries(text):
+              entries = []
+              for line in text.splitlines():
+                  line = line.strip()
+                  m_mal = re.match(r"<h1\s+([^>]+)><\/h1>", line, re.I)
+                  if m_mal:
+                      line = f"<h1>{m_mal.group(1).strip()}</h1>"
+                  m = re.search(r"<h1>\s*(\d+)\.?\s*(.*?)\s*<\/h1>", line, re.I)
+                  if m:
+                      num = int(m.group(1))
+                      name = m.group(2).strip()
+                      entries.append((num, name))
+              return entries
+
+          with open("index.html", "r", encoding="utf-8") as f:
+              curr_entries = parse_entries(f.read())
+
+          pr_text = subprocess.check_output(["git", "show", f"pr-{pr_number}:index.html"]).decode("utf-8", errors="ignore")
+          pr_entries = parse_entries(pr_text)
+
+          all_entries = list(curr_entries)
+          seen = set((num, name.upper()) for num, name in curr_entries)
+          for num, name in pr_entries:
+              key = (num, name.upper())
+              if key not in seen:
+                  all_entries.append((num, name))
+                  seen.add(key)
+
+          all_entries.sort(key=lambda x: (x[0], x[1]))
+
+          lines = [f"    <h1>{num}. {name}</h1>" for num, name in all_entries]
+          html = "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n    <meta charset=\"UTF-8\">\n    <meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\">\n    <title>Document</title>\n</head>\n<body>\n" + "\n".join(lines) + "\n</body>\n</html>\n"
+
+          msg = f"Merge pull request #{pr_number} from {pr_user}/{pr_ref}"
+          subprocess.run(["git", "merge", "--no-ff", f"pr-{pr_number}", "-m", msg], capture_output=True)
+
+          with open("index.html", "w", encoding="utf-8") as f:
+              f.write(html)
+
+          subprocess.run(["git", "add", "index.html"], check=True)
+
+          if os.path.exists(".git/MERGE_HEAD"):
+              subprocess.run(["git", "commit", "-m", msg], check=True)
+          else:
+              diff = subprocess.run(["git", "diff", "--staged", "--quiet"])
+              if diff.returncode != 0:
+                  subprocess.run(["git", "commit", "--amend", "--no-edit"], check=True)
+          '
+
+          git push origin main
